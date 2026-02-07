@@ -353,3 +353,49 @@ export async function recreateOpenClawContainer(params: {
     hostPort: parseInt(hostPort, 10),
   };
 }
+
+// Stop container (keeps volume and data)
+export async function stopOpenClawContainer(containerName: string): Promise<void> {
+  const container = docker.getContainer(containerName);
+  const info = await container.inspect();
+  if (info.State.Running) {
+    await container.stop();
+  }
+}
+
+// Start stopped container and get new port
+export async function startOpenClawContainer(containerName: string): Promise<{ hostPort: number }> {
+  const container = docker.getContainer(containerName);
+  await container.start();
+  const inspectData = await container.inspect();
+  const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
+  if (!hostPort) {
+    throw new Error("Failed to get assigned host port for OpenClaw container");
+  }
+  return { hostPort: parseInt(hostPort, 10) };
+}
+
+// Delete container and volume
+export async function deleteOpenClawInstance(params: {
+  containerName: string;
+  volumeName: string;
+}): Promise<void> {
+  // Stop and remove container
+  try {
+    const container = docker.getContainer(params.containerName);
+    const info = await container.inspect();
+    if (info.State.Running) {
+      await container.stop();
+    }
+    await container.remove();
+  } catch (err: any) {
+    if (err.statusCode !== 404) throw err;
+  }
+  // Remove volume
+  try {
+    const volume = docker.getVolume(params.volumeName);
+    await volume.remove();
+  } catch (err: any) {
+    if (err.statusCode !== 404) throw err;
+  }
+}

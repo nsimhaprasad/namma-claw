@@ -28,6 +28,25 @@ export function page(title: string, body: string, scripts: string = "") {
       .status-dot.running { background-color: var(--pico-ins-color); box-shadow: 0 0 8px var(--pico-ins-color); }
       .status-dot.stopped { background-color: var(--pico-del-color); }
       .status-dot.starting { background-color: var(--pico-primary-color); animation: pulse 1.5s infinite; }
+
+      .status-badge {
+        display: inline-block;
+        padding: 0.15rem 0.5rem;
+        border-radius: 0.25rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+      }
+      .status-badge.status-running {
+        background-color: color-mix(in srgb, var(--pico-ins-color) 20%, transparent);
+        color: var(--pico-ins-color);
+        border: 1px solid var(--pico-ins-color);
+      }
+      .status-badge.status-stopped {
+        background-color: color-mix(in srgb, var(--pico-del-color) 20%, transparent);
+        color: var(--pico-del-color);
+        border: 1px solid var(--pico-del-color);
+      }
       
       @keyframes pulse { 0% { opacity: 0.5; } 50% { opacity: 1; } 100% { opacity: 0.5; } }
 

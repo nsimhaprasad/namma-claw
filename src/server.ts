@@ -25,6 +25,9 @@ import {
   createOpenClawInstance,
   recreateOpenClawContainer,
   updateOpenClawConfig,
+  stopOpenClawContainer,
+  startOpenClawContainer,
+  deleteOpenClawInstance,
 } from "./docker/openclaw.js";
 
 const app = express();
@@ -97,6 +100,14 @@ async function getInstanceBySlug(slug: string): Promise<InstanceRow | null> {
 async function userHasInstanceAccess(userId: string, instanceId: string): Promise<boolean> {
   const rows = await query<{ ok: boolean }>(
     "select true as ok from instance_members where instance_id=$1 and user_id=$2 limit 1",
+    [instanceId, userId],
+  );
+  return Boolean(rows[0]?.ok);
+}
+
+async function isInstanceOwner(userId: string, instanceId: string): Promise<boolean> {
+  const rows = await query<{ ok: boolean }>(
+    "select true as ok from instance_members where instance_id=$1 and user_id=$2 and role='owner' limit 1",
     [instanceId, userId],
   );
   return Boolean(rows[0]?.ok);
@@ -248,14 +259,16 @@ app.get("/instances", requireAuth, async (req, res) => {
       <article>
         <header class="card-header-actions">
           <strong>${escapeHtml(i.slug)}</strong>
-          <span class="muted-text">${escapeHtml(i.status)}</span>
+          <span class="status-badge ${i.status === 'running' ? 'status-running' : 'status-stopped'}">${escapeHtml(i.status)}</span>
         </header>
         <div class="grid">
           <div>
             <a role="button" href="/i/${encodeURIComponent(i.slug)}">Open Dashboard</a>
-            ${i.power_user_enabled
+            ${i.status === 'running' && i.power_user_enabled
           ? `<a role="button" class="secondary outline" href="/i/${encodeURIComponent(i.slug)}/openclaw">OpenClaw GUI</a>`
-          : ``
+          : i.status !== 'running'
+            ? `<span class="muted-text" style="padding: 0.5rem;">Container stopped</span>`
+            : ``
         }
           </div>
         </div>
@@ -340,14 +353,43 @@ app.get("/i/:slug/status", requireAuth, async (req, res) => {
 
   try {
     const container = docker.getContainer(inst.container_name);
-    const stats = await container.inspect();
-    const isRunning = stats.State.Running;
+    const inspectData = await container.inspect();
+    const isRunning = inspectData.State.Running;
+
+    let memoryUsage = null;
+    let memoryLimit = null;
+    let memoryPercent = null;
+    let cpuPercent = null;
+
+    if (isRunning) {
+      // Get live container stats (stream: false for single snapshot)
+      const statsData = await container.stats({ stream: false }) as any;
+      if (statsData.memory_stats) {
+        memoryUsage = statsData.memory_stats.usage || 0;
+        memoryLimit = statsData.memory_stats.limit || 0;
+        if (memoryLimit > 0) {
+          memoryPercent = Math.round((memoryUsage / memoryLimit) * 100);
+        }
+      }
+      // Calculate CPU percentage
+      if (statsData.cpu_stats && statsData.precpu_stats) {
+        const cpuDelta = statsData.cpu_stats.cpu_usage.total_usage - statsData.precpu_stats.cpu_usage.total_usage;
+        const systemDelta = statsData.cpu_stats.system_cpu_usage - statsData.precpu_stats.system_cpu_usage;
+        const numCpus = statsData.cpu_stats.online_cpus || statsData.cpu_stats.cpu_usage.percpu_usage?.length || 1;
+        if (systemDelta > 0) {
+          cpuPercent = Math.round((cpuDelta / systemDelta) * numCpus * 100);
+        }
+      }
+    }
 
     res.json({
       status: isRunning ? "running" : "stopped",
-      startedAt: stats.State.StartedAt,
-      restartTime: stats.State.Restarting ? "restarting" : null,
-      memory: "2GB Limit", // Static for now, could be dynamic
+      startedAt: inspectData.State.StartedAt,
+      restartTime: inspectData.State.Restarting ? "restarting" : null,
+      memoryUsage: memoryUsage ? `${Math.round(memoryUsage / 1024 / 1024)}MB` : null,
+      memoryLimit: memoryLimit ? `${Math.round(memoryLimit / 1024 / 1024)}MB` : "2048MB",
+      memoryPercent,
+      cpuPercent,
     });
   } catch (err) {
     res.json({ status: "error", error: String(err) });
@@ -384,6 +426,12 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
             <h1>${escapeHtml(inst.slug)}</h1>
             <h2><span id="status-dot" class="status-dot"></span> <span id="status-text">Checking status...</span></h2>
         </hgroup>
+        <div id="resource-stats" style="display: none; margin-top: 0.5rem;">
+          <small class="muted-text">
+            <span id="memory-stat">Memory: --</span> |
+            <span id="cpu-stat">CPU: --</span>
+          </small>
+        </div>
       </header>
       
       <div class="grid">
@@ -438,9 +486,23 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
            <article>
             <header><strong>API Keys</strong></header>
             ${savedKeys.length > 0
-        ? `<p><small class="muted-text">Configured: ${savedKeys.map(k => `<span data-tooltip="Configured">✅ ${k.split('_')[0]}</span>`).join(", ")}</small></p>`
+        ? `<div style="margin-bottom: 1rem;">
+             <small class="muted-text">Configured Keys:</small>
+             <div style="margin-top: 0.5rem;">
+               ${savedKeys.map(k => `
+                 <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.4rem 0.6rem; background: var(--pico-card-background-color); border-radius: 0.25rem; margin-bottom: 0.25rem;">
+                   <span><span style="color: var(--pico-ins-color);">✓</span> ${escapeHtml(k)}</span>
+                   <form method="post" action="/i/${encodeURIComponent(inst.slug)}/secrets/delete" style="margin: 0;"
+                         onsubmit="return confirm('Remove ${escapeHtml(k)}? Container will restart.')">
+                     <input type="hidden" name="key" value="${escapeHtml(k)}" />
+                     <button type="submit" class="secondary outline" style="padding: 0.2rem 0.5rem; font-size: 0.75rem;">Remove</button>
+                   </form>
+                 </div>
+               `).join("")}
+             </div>
+           </div>`
         : `<p><small class="muted-text">No keys configured.</small></p>`}
-            
+
             <form method="post" action="/i/${encodeURIComponent(inst.slug)}/secrets">
               <label>
                 Provider Key
@@ -456,8 +518,6 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
               <button type="submit">Save Secret</button>
               <small class="muted-text">Saving will restart the container.</small>
             </form>
-          </article>
-
           </article>
 
           <!-- Advanced Configuration -->
@@ -495,12 +555,27 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
           <!-- System Ops -->
           <article>
             <header><strong>System Operations</strong></header>
-            <form method="post" action="/i/${encodeURIComponent(inst.slug)}/restart">
-                <button type="submit" class="contrast outline">Restart Container</button>
-            </form>
-            
+
+            <!-- Status-based Start/Stop -->
+            ${inst.status === 'running'
+        ? `<form method="post" action="/i/${encodeURIComponent(inst.slug)}/stop">
+             <button type="submit" class="secondary">Stop Container</button>
+           </form>`
+        : `<form method="post" action="/i/${encodeURIComponent(inst.slug)}/start">
+             <button type="submit">Start Container</button>
+           </form>`
+      }
+
+            <!-- Restart (only when running) -->
+            ${inst.status === 'running'
+        ? `<form method="post" action="/i/${encodeURIComponent(inst.slug)}/restart" style="margin-top: 0.5rem;">
+             <button type="submit" class="contrast outline">Restart Container</button>
+           </form>`
+        : ''
+      }
+
             <hr />
-            
+
              <form method="post" action="/i/${encodeURIComponent(inst.slug)}/power">
               <label>
                 <input type="checkbox" name="enabled" value="true" ${inst.power_user_enabled ? "checked" : ""} />
@@ -512,6 +587,18 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
         ? `<a role="button" href="/i/${encodeURIComponent(inst.slug)}/openclaw" class="contrast">Launch Dashboard</a>`
         : ``
       }
+
+            <hr />
+
+            <!-- Delete with confirmation -->
+            <details>
+              <summary style="color: var(--pico-del-color);">Delete Instance</summary>
+              <p><small>This will permanently delete the container, all data, and configuration. This cannot be undone.</small></p>
+              <form method="post" action="/i/${encodeURIComponent(inst.slug)}/delete"
+                    onsubmit="return confirm('Are you sure you want to delete this instance? This cannot be undone.')">
+                <button type="submit" class="secondary" style="background-color: var(--pico-del-color);">Delete Forever</button>
+              </form>
+            </details>
           </article>
         </div>
       </div>
@@ -524,16 +611,29 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
             const data = await res.json();
             const dot = document.getElementById('status-dot');
             const text = document.getElementById('status-text');
-            
+            const resourceStats = document.getElementById('resource-stats');
+            const memoryStat = document.getElementById('memory-stat');
+            const cpuStat = document.getElementById('cpu-stat');
+
             dot.className = 'status-dot ' + (data.status === 'running' ? 'running' : 'stopped');
-            text.textContent = data.status === 'running' 
-                ? 'Running (Up since ' + new Date(data.startedAt).toLocaleTimeString() + ')' 
+            text.textContent = data.status === 'running'
+                ? 'Running (Up since ' + new Date(data.startedAt).toLocaleTimeString() + ')'
                 : 'Stopped';
+
+            // Show resource stats when running
+            if (data.status === 'running' && data.memoryUsage) {
+                resourceStats.style.display = 'block';
+                memoryStat.textContent = 'Memory: ' + data.memoryUsage + ' / ' + data.memoryLimit +
+                    (data.memoryPercent !== null ? ' (' + data.memoryPercent + '%)' : '');
+                cpuStat.textContent = 'CPU: ' + (data.cpuPercent !== null ? data.cpuPercent + '%' : '--');
+            } else {
+                resourceStats.style.display = 'none';
+            }
         } catch (e) {
             console.error('Status poll failed', e);
         }
     }
-    
+
     // Poll every 5 seconds
     setInterval(updateStatus, 5000);
     updateStatus(); // Initial call
@@ -552,6 +652,39 @@ app.post("/i/:slug/restart", requireAuth, async (req, res) => {
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
 
+app.post("/i/:slug/stop", requireAuth, async (req, res) => {
+  const session = (req as AuthedRequest).session;
+  const inst = await getInstanceBySlug(String(req.params.slug || ""));
+  if (!inst) return res.status(404).send("not found");
+  if (!(await isInstanceOwner(session.userId, inst.id))) return res.status(403).send("forbidden - owner only");
+  await stopOpenClawContainer(inst.container_name);
+  await query("update instances set status=$1, updated_at=now() where id=$2", ["stopped", inst.id]);
+  res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
+});
+
+app.post("/i/:slug/start", requireAuth, async (req, res) => {
+  const session = (req as AuthedRequest).session;
+  const inst = await getInstanceBySlug(String(req.params.slug || ""));
+  if (!inst) return res.status(404).send("not found");
+  if (!(await isInstanceOwner(session.userId, inst.id))) return res.status(403).send("forbidden - owner only");
+  await startOpenClawContainer(inst.container_name);
+  await query("update instances set status=$1, updated_at=now() where id=$2", ["running", inst.id]);
+  res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
+});
+
+app.post("/i/:slug/delete", requireAuth, async (req, res) => {
+  const session = (req as AuthedRequest).session;
+  const inst = await getInstanceBySlug(String(req.params.slug || ""));
+  if (!inst) return res.status(404).send("not found");
+  if (!(await isInstanceOwner(session.userId, inst.id))) return res.status(403).send("forbidden - owner only");
+  await deleteOpenClawInstance({
+    containerName: inst.container_name,
+    volumeName: inst.state_volume,
+  });
+  await query("delete from instances where id=$1", [inst.id]);
+  res.redirect("/instances");
+});
+
 app.post("/i/:slug/secrets", requireAuth, async (req, res) => {
   const session = (req as AuthedRequest).session;
   const inst = await getInstanceBySlug(String(req.params.slug || ""));
@@ -563,6 +696,19 @@ app.post("/i/:slug/secrets", requireAuth, async (req, res) => {
   if (!value.trim()) return res.status(400).send("empty value");
   await upsertInstanceSecret(inst.id, key, value.trim());
   // Restart container to pick up new environment variables
+  await rebootInstance(inst);
+  res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
+});
+
+app.post("/i/:slug/secrets/delete", requireAuth, async (req, res) => {
+  const session = (req as AuthedRequest).session;
+  const inst = await getInstanceBySlug(String(req.params.slug || ""));
+  if (!inst) return res.status(404).send("not found");
+  if (!(await userHasInstanceAccess(session.userId, inst.id))) return res.status(403).send("forbidden");
+  const key = String(req.body?.key ?? "").trim();
+  if (!SecretKeyAllowlist.has(key)) return res.status(400).send("unsupported key");
+  await query("delete from instance_secrets where instance_id=$1 and key=$2", [inst.id, key]);
+  // Restart container to remove the environment variable
   await rebootInstance(inst);
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
