@@ -15,11 +15,11 @@ export type InstanceRuntime = {
 // - Linux: /var/run/docker.sock
 // - Override with DOCKER_SOCKET env var if set
 const socketPath = process.env.DOCKER_SOCKET ||
-  (process.platform === 'darwin' && process.env.HOME
+  (process.platform === 'darwin' & amp;& amp; process.env.HOME
     ? `${process.env.HOME}/.colima/default/docker.sock`
     : '/var/run/docker.sock');
 
-export const docker = new Docker({ socketPath });
+const docker = new Docker({ socketPath });
 
 export async function ensureNetwork(): Promise<void> {
   const name = config.docker.network;
@@ -65,13 +65,6 @@ function buildOpenClawConfigJson(params: {
     },
     channels: {
       whatsapp,
-    },
-    plugins: {
-      entries: {
-        whatsapp: {
-          enabled: true, // Auto-enable WhatsApp plugin
-        },
-      },
     },
   };
 
@@ -164,7 +157,7 @@ export async function createOpenClawInstance(params: {
     name: containerName,
     Image: config.docker.openclawImage,
     Env: envPairs,
-    Cmd: ["node", "--max-old-space-size=1536", "dist/index.js", "gateway", "--allow-unconfigured", "--bind", "lan", "--port", "18789"],
+    Cmd: ["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan", "--port", "18789"],
     HostConfig: {
       RestartPolicy: { Name: "unless-stopped" },
       Mounts: [
@@ -174,17 +167,10 @@ export async function createOpenClawInstance(params: {
           Target: config.docker.dataMountPath,
         },
       ],
-      // Resource limits: 2GB RAM, 2 CPUs
-      Memory: 2 * 1024 * 1024 * 1024, // 2GB
-      NanoCpus: 2_000_000_000, // 2 CPUs
-      PidsLimit: 512,
-      // Expose port so host can connect via localhost
-      PortBindings: {
-        "18789/tcp": [{ HostPort: "0" }], // Docker assigns random available port
-      },
-    },
-    ExposedPorts: {
-      "18789/tcp": {},
+      // Basic noisy-neighbor controls (tune later).
+      Memory: 1024 * 1024 * 1024,
+      NanoCpus: 1_000_000_000, // 1 CPU
+      PidsLimit: 256,
     },
     NetworkingConfig: {
       EndpointsConfig: {
@@ -197,34 +183,17 @@ export async function createOpenClawInstance(params: {
 
   await c.start();
 
-  // Get the dynamically assigned host port
-  const inspectData = await c.inspect();
-  const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
-  if (!hostPort) {
-    throw new Error("Failed to get assigned host port for OpenClaw container");
-  }
-
   return {
     containerName,
     volumeName,
     gatewayToken: token,
-    wsUrl: `ws://localhost:${hostPort}/openclaw/${params.slug}`,
-    hostPort: parseInt(hostPort, 10),
+    wsUrl: `ws://${containerName}:${config.docker.openclawPort}`,
   };
 }
 
 export async function restartOpenClawContainer(containerName: string) {
   const c = docker.getContainer(containerName);
-  try {
-    await c.inspect();
-    await c.restart();
-  } catch (err: any) {
-    // Container doesn't exist - this is expected if it was manually removed or failed to create
-    if (err.statusCode === 404) {
-      throw new Error(`Container ${containerName} does not exist. Please recreate the instance.`);
-    }
-    throw err;
-  }
+  await c.restart();
 }
 
 export async function updateOpenClawConfig(params: {
@@ -242,3 +211,4 @@ export async function updateOpenClawConfig(params: {
     powerUserEnabled: params.powerUserEnabled,
   });
 }
+

@@ -299,10 +299,6 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
     res.status(403).send("forbidden");
     return;
   }
-  // Get saved secrets to display which keys are configured
-  const secrets = await getInstanceSecrets(inst.id);
-  const savedKeys = Object.keys(secrets).filter((k) => SecretKeyAllowlist.has(k));
-
 
   res.send(
     page(
@@ -323,11 +319,6 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
       <div class="card">
         <h2>LLM keys</h2>
         <form method="post" action="/i/${encodeURIComponent(inst.slug)}/secrets">
-        ${savedKeys.length > 0
-        ? `<div class="muted">✓ Saved keys: ${savedKeys.map((k) => escapeHtml(k)).join(", ")}</div><br/>`
-        : `<div class="muted">No keys configured yet.</div><br/>`
-      }
-
           <div class="row">
             <label>Key
               <select name="key">
@@ -453,17 +444,7 @@ async function withOpenClawClient(inst: InstanceRow, fn: (c: OpenClawWsClient) =
   if (!token) {
     throw new Error("missing gateway token secret");
   }
-
-  // Get the container's exposed port
-  const { docker } = await import("./docker/openclaw.js");
-  const container = docker.getContainer(inst.container_name);
-  const inspectData = await container.inspect();
-  const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
-  if (!hostPort) {
-    throw new Error(`Container ${inst.container_name} has no exposed port`);
-  }
-
-  const wsUrl = `ws://localhost:${hostPort}/openclaw/${inst.slug}`;
+  const wsUrl = `ws://${inst.container_name}:18789/openclaw/${inst.slug}`;
   const client = new OpenClawWsClient(wsUrl, token);
   try {
     await client.connect();

@@ -103,17 +103,16 @@ export class OpenClawWsClient {
       minProtocol: 3,
       maxProtocol: 3,
       client: {
-        id: "nc-web",
-        version: "dev",
-        platform: "server",
-        mode: "webchat",
+        id: "openclaw-cli",
+        version: "1.0.0",
+        platform: "node",
       },
       role: "operator",
       scopes: ["operator.admin"],
       device: undefined,
       caps: [],
       auth: { token: this.token },
-      userAgent: "nc-web",
+      userAgent: "nc-control/1.0",
       locale: "en-US",
     });
   }

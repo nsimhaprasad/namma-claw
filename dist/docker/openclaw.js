@@ -1,0 +1,163 @@
+import Docker from "dockerode";
+import { randomBytes } from "node:crypto";
+import { config } from "../config.js";
+// Configure Docker socket path
+// - macOS with Colima: ~/.colima/default/docker.sock
+// - macOS with Docker Desktop: /var/run/docker.sock
+// - Linux: /var/run/docker.sock
+// - Override with DOCKER_SOCKET env var if set
+const socketPath = process.env.DOCKER_SOCKET ||
+    (process.platform === 'darwin' && process.env.HOME
+        ? `${process.env.HOME}/.colima/default/docker.sock`
+        : '/var/run/docker.sock');
+const docker = new Docker({ socketPath });
+export async function ensureNetwork() {
+    const name = config.docker.network;
+    const networks = await docker.listNetworks({ filters: { name: [name] } });
+    if (networks.some((n) => n.Name === name)) {
+        return;
+    }
+    await docker.createNetwork({ Name: name, Driver: "bridge" });
+}
+function gatewayToken() {
+    return randomBytes(32).toString("hex");
+}
+function buildOpenClawConfigJson(params) {
+    const basePath = `/openclaw/${params.slug}`;
+    const whatsapp = {};
+    if (params.ownerE164 && params.ownerE164.trim()) {
+        whatsapp.dmPolicy = "allowlist";
+        whatsapp.allowFrom = [params.ownerE164.trim()];
+    }
+    else {
+        whatsapp.dmPolicy = "pairing";
+    }
+    const cfg = {
+        gateway: {
+            bind: "lan",
+            controlUi: params.powerUserEnabled
+                ? {
+                    enabled: true,
+                    basePath,
+                    dangerouslyDisableDeviceAuth: true,
+                }
+                : {
+                    enabled: false,
+                    dangerouslyDisableDeviceAuth: true,
+                },
+        },
+        channels: {
+            whatsapp,
+        },
+    };
+    if (params.defaultModel && params.defaultModel.trim()) {
+        cfg.agents = { defaults: { model: { primary: params.defaultModel.trim() } } };
+    }
+    return JSON.stringify(cfg, null, 2);
+}
+async function initVolume(opts) {
+    const mountPath = config.docker.dataMountPath;
+    const stateDir = `${mountPath}/.openclaw`;
+    const workspaceDir = `${mountPath}/workspace`;
+    const cfg = buildOpenClawConfigJson({
+        slug: opts.slug,
+        ownerE164: opts.ownerE164,
+        defaultModel: opts.defaultModel,
+        powerUserEnabled: opts.powerUserEnabled,
+    });
+    // Root init container sets ownership to uid 1000 (OpenClaw runs as node user).
+    const cmd = [
+        "sh",
+        "-lc",
+        [
+            `set -euo pipefail`,
+            `mkdir -p ${stateDir} ${workspaceDir}`,
+            `cat > ${stateDir}/openclaw.json <<'EOF'\n${cfg}\nEOF`,
+            `chown -R 1000:1000 ${mountPath}`,
+        ].join("\n"),
+    ];
+    const c = await docker.createContainer({
+        Image: "alpine:3.19",
+        Cmd: cmd,
+        HostConfig: {
+            AutoRemove: true,
+            Binds: [],
+            Mounts: [
+                {
+                    Type: "volume",
+                    Source: opts.volumeName,
+                    Target: mountPath,
+                },
+            ],
+        },
+    });
+    await c.start();
+    await c.wait();
+}
+export async function createOpenClawInstance(params) {
+    await ensureNetwork();
+    const containerName = `nc-openclaw-${params.instanceId}`;
+    const volumeName = `nc-openclaw-data-${params.instanceId}`;
+    const token = gatewayToken();
+    await docker.createVolume({ Name: volumeName });
+    await initVolume({
+        volumeName,
+        slug: params.slug,
+        ownerE164: params.ownerE164,
+        defaultModel: params.defaultModel,
+        powerUserEnabled: params.powerUserEnabled,
+    });
+    const envPairs = Object.entries({
+        ...params.env,
+        OPENCLAW_STATE_DIR: `${config.docker.dataMountPath}/.openclaw`,
+        OPENCLAW_WORKSPACE_DIR: `${config.docker.dataMountPath}/workspace`,
+        OPENCLAW_GATEWAY_TOKEN: token,
+    }).map(([k, v]) => `${k}=${v}`);
+    const c = await docker.createContainer({
+        name: containerName,
+        Image: config.docker.openclawImage,
+        Env: envPairs,
+        Cmd: ["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan", "--port", "18789"],
+        HostConfig: {
+            RestartPolicy: { Name: "unless-stopped" },
+            Mounts: [
+                {
+                    Type: "volume",
+                    Source: volumeName,
+                    Target: config.docker.dataMountPath,
+                },
+            ],
+            // Basic noisy-neighbor controls (tune later).
+            Memory: 1024 * 1024 * 1024,
+            NanoCpus: 1_000_000_000, // 1 CPU
+            PidsLimit: 256,
+        },
+        NetworkingConfig: {
+            EndpointsConfig: {
+                [config.docker.network]: {
+                    Aliases: [containerName],
+                },
+            },
+        },
+    });
+    await c.start();
+    return {
+        containerName,
+        volumeName,
+        gatewayToken: token,
+        wsUrl: `ws://${containerName}:${config.docker.openclawPort}`,
+    };
+}
+export async function restartOpenClawContainer(containerName) {
+    const c = docker.getContainer(containerName);
+    await c.restart();
+}
+export async function updateOpenClawConfig(params) {
+    await initVolume({
+        volumeName: params.volumeName,
+        slug: params.slug,
+        ownerE164: params.ownerE164,
+        defaultModel: params.defaultModel,
+        powerUserEnabled: params.powerUserEnabled,
+    });
+}
