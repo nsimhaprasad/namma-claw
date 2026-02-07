@@ -20,8 +20,10 @@ import { decryptSecret, encryptSecret } from "./crypto.js";
 import { page, escapeHtml } from "./views.js";
 import { OpenClawWsClient } from "./openclaw/ws-client.js";
 import {
+  docker,
+  ensureNetwork,
   createOpenClawInstance,
-  restartOpenClawContainer,
+  recreateOpenClawContainer,
   updateOpenClawConfig,
 } from "./docker/openclaw.js";
 
@@ -42,6 +44,8 @@ type InstanceRow = {
   state_volume: string;
   owner_e164: string | null;
   default_model: string | null;
+  system_prompt: string | null;
+  plugins_config: string | null; // JSON string
   power_user_enabled: boolean;
 };
 
@@ -53,7 +57,6 @@ const SlugSchema = z
   .regex(/^[a-z][a-z0-9-]+$/, "slug must be dns-safe (a-z, 0-9, '-')");
 
 const SecretKeyAllowlist = new Set<string>([
-  // OpenClaw expected keys + common providers
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_OAUTH_TOKEN",
@@ -61,10 +64,30 @@ const SecretKeyAllowlist = new Set<string>([
   "ZAI_API_KEY",
   "OPENROUTER_API_KEY",
   "AI_GATEWAY_API_KEY",
+  "AI_GATEWAY_API_KEY",
   "MINIMAX_API_KEY",
   "SYNTHETIC_API_KEY",
   "DEEPGRAM_API_KEY",
+  // Plugin Specific
+  "SMTP_HOST",
+  "SMTP_PORT",
+  "SMTP_USER",
+  "SMTP_PASSWORD",
+  "TWILIO_ACCOUNT_SID",
+  "TWILIO_AUTH_TOKEN",
+  "TWILIO_FROM_NUMBER",
+  "SLACK_BOT_TOKEN",
+  "SLACK_SIGNING_SECRET",
 ]);
+
+const SupportedModels = [
+  { id: "google/gemini-3-flash-preview", label: "Google Gemini 1.5 Flash" },
+  { id: "google/gemini-1.5-pro-latest", label: "Google Gemini 1.5 Pro" },
+  { id: "anthropic/claude-opus-4-6", label: "Anthropic Claude 3 Opus" },
+  { id: "anthropic/claude-sonnet-4-5", label: "Anthropic Claude 3.5 Sonnet" },
+  { id: "openai/gpt-5.2", label: "OpenAI GPT-4o" },
+  { id: "openai/gpt-5-mini", label: "OpenAI GPT-4o Mini" },
+];
 
 async function getInstanceBySlug(slug: string): Promise<InstanceRow | null> {
   const rows = await query<InstanceRow>("select * from instances where slug=$1 limit 1", [slug]);
@@ -105,7 +128,6 @@ async function upsertInstanceSecret(instanceId: string, key: string, value: stri
 }
 
 function requireSslInProd() {
-  // For production, set cookies secure=true and consider HSTS. Keep dev simple.
 }
 
 app.get("/", (req, res) => {
@@ -117,14 +139,20 @@ app.get("/signup", (_req, res) => {
     page(
       "Sign up",
       `
-      <h1>nc.beskar.tech</h1>
-      <div class="card">
-        <form method="post" action="/signup">
-          <div class="row"><label>Email <input name="email" type="email" required /></label></div>
-          <div class="row"><label>Password <input name="password" type="password" required /></label></div>
-          <div class="row"><button type="submit">Create account</button> <a href="/login">Login</a></div>
-        </form>
-      </div>
+      <article class="grid">
+        <div>
+          <hgroup>
+            <h1>Sign up</h1>
+            <h2>Create your OpenClaw account</h2>
+          </hgroup>
+          <form method="post" action="/signup">
+            <label>Email <input name="email" type="email" placeholder="you@example.com" required /></label>
+            <label>Password <input name="password" type="password" required /></label>
+            <button type="submit">Create account</button>
+          </form>
+          <p><small>Already have an account? <a href="/login">Login</a></small></p>
+        </div>
+      </article>
     `,
     ),
   );
@@ -159,14 +187,20 @@ app.get("/login", (_req, res) => {
     page(
       "Login",
       `
-      <h1>nc.beskar.tech</h1>
-      <div class="card">
-        <form method="post" action="/login">
-          <div class="row"><label>Email <input name="email" type="email" required /></label></div>
-          <div class="row"><label>Password <input name="password" type="password" required /></label></div>
-          <div class="row"><button type="submit">Login</button> <a href="/signup">Sign up</a></div>
-        </form>
-      </div>
+      <article class="grid">
+        <div>
+          <hgroup>
+            <h1>Login</h1>
+            <h2>Welcome back to OpenClaw</h2>
+          </hgroup>
+          <form method="post" action="/login">
+            <label>Email <input name="email" type="email" placeholder="you@example.com" required /></label>
+            <label>Password <input name="password" type="password" required /></label>
+            <button type="submit">Login</button>
+          </form>
+          <p><small>Don't have an account? <a href="/signup">Sign up</a></small></p>
+        </div>
+      </article>
     `,
     ),
   );
@@ -207,19 +241,25 @@ app.get("/instances", requireAuth, async (req, res) => {
   `,
     [session.userId],
   );
+
   const list = rows
     .map(
       (i) => `
-      <div class="card">
-        <div><b>${escapeHtml(i.slug)}</b> <span class="muted">(${escapeHtml(i.status)})</span></div>
-        <div class="row">
-          <a href="/i/${encodeURIComponent(i.slug)}">Open</a>
-          ${i.power_user_enabled
-          ? `<a href="/i/${encodeURIComponent(i.slug)}/openclaw">OpenClaw dashboard</a>`
-          : `<span class="muted">dashboard disabled</span>`
+      <article>
+        <header class="card-header-actions">
+          <strong>${escapeHtml(i.slug)}</strong>
+          <span class="muted-text">${escapeHtml(i.status)}</span>
+        </header>
+        <div class="grid">
+          <div>
+            <a role="button" href="/i/${encodeURIComponent(i.slug)}">Open Dashboard</a>
+            ${i.power_user_enabled
+          ? `<a role="button" class="secondary outline" href="/i/${encodeURIComponent(i.slug)}/openclaw">OpenClaw GUI</a>`
+          : ``
         }
+          </div>
         </div>
-      </div>
+      </article>
     `,
     )
     .join("\n");
@@ -228,18 +268,23 @@ app.get("/instances", requireAuth, async (req, res) => {
     page(
       "Instances",
       `
-      <div class="row" style="justify-content: space-between;">
-        <h1>Instances</h1>
-        <form method="post" action="/logout"><button type="submit">Logout</button></form>
-      </div>
-      <div class="card">
-        <form method="post" action="/instances">
-          <div class="row"><label>Slug <input name="slug" placeholder="simha" required /></label></div>
-          <div class="row"><button type="submit">Create instance</button></div>
-          <div class="muted">This provisions a per-user OpenClaw container on the server.</div>
+      <hgroup>
+        <h1>Your Instances</h1>
+        <h2>Manage your OpenClaw containers</h2>
+      </hgroup>
+      
+      <article>
+        <header><strong>Create New Instance</strong></header>
+        <form method="post" action="/instances" style="margin-bottom: 0;">
+          <fieldset role="group">
+            <input name="slug" placeholder="Instance Name (e.g. jarvis)" required />
+            <button type="submit">Create</button>
+          </fieldset>
+          <small class="muted-text">Provisions a dedicated docker container.</small>
         </form>
-      </div>
-      ${list || `<div class="muted">No instances yet.</div>`}
+      </article>
+
+      ${list || `<article><p class="muted-text">No instances yet.</p></article>`}
     `,
     ),
   );
@@ -274,7 +319,6 @@ app.post("/instances", requireAuth, async (req, res) => {
     [instanceId, session.userId, "owner"],
   );
 
-  // Create container. Start with no provider env; users can set keys later.
   const runtime = await createOpenClawInstance({
     instanceId,
     slug: slug.data,
@@ -285,6 +329,29 @@ app.post("/instances", requireAuth, async (req, res) => {
   await query("update instances set status=$1 where id=$2", ["running", instanceId]);
 
   res.redirect(`/i/${encodeURIComponent(slug.data)}`);
+});
+
+app.get("/i/:slug/status", requireAuth, async (req, res) => {
+  const session = (req as AuthedRequest).session;
+  const inst = await getInstanceBySlug(String(req.params.slug || ""));
+  if (!inst || !(await userHasInstanceAccess(session.userId, inst.id))) {
+    return res.status(404).json({ error: "not found" });
+  }
+
+  try {
+    const container = docker.getContainer(inst.container_name);
+    const stats = await container.inspect();
+    const isRunning = stats.State.Running;
+
+    res.json({
+      status: isRunning ? "running" : "stopped",
+      startedAt: stats.State.StartedAt,
+      restartTime: stats.State.Restarting ? "restarting" : null,
+      memory: "2GB Limit", // Static for now, could be dynamic
+    });
+  } catch (err) {
+    res.json({ status: "error", error: String(err) });
+  }
 });
 
 app.get("/i/:slug", requireAuth, async (req, res) => {
@@ -299,100 +366,189 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
     res.status(403).send("forbidden");
     return;
   }
-  // Get saved secrets to display which keys are configured
   const secrets = await getInstanceSecrets(inst.id);
   const savedKeys = Object.keys(secrets).filter((k) => SecretKeyAllowlist.has(k));
-
 
   res.send(
     page(
       `Instance ${inst.slug}`,
       `
-      <div class="row" style="justify-content: space-between;">
-        <h1>${escapeHtml(inst.slug)}</h1>
-        <div class="row"><a href="/instances">Back</a></div>
-      </div>
+      <header class="container" style="padding-bottom: 0; border: none; margin-bottom: 1rem;">
+        <nav aria-label="breadcrumb">
+          <ul>
+            <li><a href="/instances">Instances</a></li>
+            <li>${escapeHtml(inst.slug)}</li>
+          </ul>
+        </nav>
+        <hgroup>
+            <h1>${escapeHtml(inst.slug)}</h1>
+            <h2><span id="status-dot" class="status-dot"></span> <span id="status-text">Checking status...</span></h2>
+        </hgroup>
+      </header>
+      
+      <div class="grid">
+        <!-- Main Configuration Column -->
+        <div>
+           <!-- WhatsApp Card -->
+          <article>
+            <header><strong>WhatsApp Integration</strong></header>
+            <form method="post" action="/i/${encodeURIComponent(inst.slug)}/owner">
+              <label>
+                Owner Phone Number (E.164 format, e.g. +15551234567)
+                <small class="muted-text">Restricts access to this number only.</small>
+                <fieldset role="group">
+                    <input name="ownerE164" placeholder="+15551234567" value="${escapeHtml(inst.owner_e164 || "")}" />
+                    <button type="submit" class="secondary">Save</button>
+                </fieldset>
+              </label>
+            </form>
 
-      <div class="card">
-        <div><b>Status</b>: ${escapeHtml(inst.status)}</div>
-        <form method="post" action="/i/${encodeURIComponent(inst.slug)}/restart">
-          <button type="submit">Restart container</button>
-        </form>
-      </div>
+            <div class="grid">
+              <form method="post" action="/i/${encodeURIComponent(inst.slug)}/whatsapp/qr/start">
+                <button type="submit">Show QR Code</button>
+              </form>
+              <form method="post" action="/i/${encodeURIComponent(inst.slug)}/whatsapp/qr/wait">
+                <button type="submit" class="outline">Check Connection</button>
+              </form>
+            </div>
+          </article>
 
-      <div class="card">
-        <h2>LLM keys</h2>
-        <form method="post" action="/i/${encodeURIComponent(inst.slug)}/secrets">
-        ${savedKeys.length > 0
-        ? `<div class="muted">✓ Saved keys: ${savedKeys.map((k) => escapeHtml(k)).join(", ")}</div><br/>`
-        : `<div class="muted">No keys configured yet.</div><br/>`
-      }
-
-          <div class="row">
-            <label>Key
-              <select name="key">
-                ${Array.from(SecretKeyAllowlist)
-        .sort()
-        .map((k) => `<option value="${escapeHtml(k)}">${escapeHtml(k)}</option>`)
-        .join("")}
-              </select>
-            </label>
-          </div>
-          <div class="row"><label>Value <input name="value" type="password" required /></label></div>
-          <div class="row"><button type="submit">Save</button></div>
-          <div class="muted">Keys are encrypted at rest. Changing keys requires a restart.</div>
-        </form>
-        <form method="post" action="/i/${encodeURIComponent(inst.slug)}/model">
-          <div class="row"><label>Default model <input name="defaultModel" placeholder="anthropic/claude-opus-4-6" /></label></div>
-          <div class="row"><button type="submit">Set model</button></div>
-        </form>
-      </div>
-
-      <div class="card">
-        <h2>WhatsApp</h2>
-        <form method="post" action="/i/${encodeURIComponent(inst.slug)}/owner">
-          <div class="row"><label>Owner phone (E.164) <input name="ownerE164" placeholder="+15551234567" value="${escapeHtml(inst.owner_e164 || "")}" /></label></div>
-          <div class="row"><button type="submit">Save owner number</button></div>
-          <div class="muted">If set, DM policy becomes allowlist. If unset, DM policy is pairing.</div>
-        </form>
-
-        <div class="row">
-          <form method="post" action="/i/${encodeURIComponent(inst.slug)}/whatsapp/qr/start">
-            <button type="submit">Generate QR</button>
-          </form>
-          <form method="post" action="/i/${encodeURIComponent(inst.slug)}/whatsapp/qr/wait">
-            <button type="submit">Wait for connection</button>
-          </form>
+          <!-- Model Config -->
+          <article>
+            <header><strong>AI Model</strong></header>
+            <form method="post" action="/i/${encodeURIComponent(inst.slug)}/model">
+              <label>
+                Default Model
+                <select name="defaultModel">
+                    <option value="" ${!inst.default_model ? "selected" : ""}>Select a model...</option>
+                    ${SupportedModels.map(
+        m => `<option value="${m.id}" ${inst.default_model === m.id ? "selected" : ""}>${m.label}</option>`
+      ).join("")}
+                </select>
+              </label>
+              <button type="submit">Update Model</button>
+            </form>
+          </article>
+      
         </div>
 
-        <div id="qr" class="muted">Use the buttons above to show a QR code.</div>
-      </div>
+        <!-- Secrets & System Column -->
+        <div>
+          <!-- Secrets -->
+           <article>
+            <header><strong>API Keys</strong></header>
+            ${savedKeys.length > 0
+        ? `<p><small class="muted-text">Configured: ${savedKeys.map(k => `<span data-tooltip="Configured">✅ ${k.split('_')[0]}</span>`).join(", ")}</small></p>`
+        : `<p><small class="muted-text">No keys configured.</small></p>`}
+            
+            <form method="post" action="/i/${encodeURIComponent(inst.slug)}/secrets">
+              <label>
+                Provider Key
+                <select name="key" required>
+                  <option value="" disabled selected>Select Provider...</option>
+                  ${Array.from(SecretKeyAllowlist).sort().map(k => `<option value="${escapeHtml(k)}">${escapeHtml(k)}</option>`).join("")}
+                </select>
+              </label>
+              <label>
+                Secret Value
+                <input name="value" type="password" placeholder="sk-..." required />
+              </label>
+              <button type="submit">Save Secret</button>
+              <small class="muted-text">Saving will restart the container.</small>
+            </form>
+          </article>
 
-      <div class="card">
-        <h2>Power user</h2>
-        <form method="post" action="/i/${encodeURIComponent(inst.slug)}/power">
-          <label>
-            <input type="checkbox" name="enabled" value="true" ${inst.power_user_enabled ? "checked" : ""} />
-            Enable OpenClaw dashboard
-          </label>
-          <div class="row"><button type="submit">Save</button></div>
-        </form>
-        ${inst.power_user_enabled
-        ? `<div class="row"><a href="/i/${encodeURIComponent(inst.slug)}/openclaw">Open dashboard</a></div>`
-        : `<div class="muted">Dashboard is disabled by default.</div>`
+          </article>
+
+          <!-- Advanced Configuration -->
+          <article>
+            <header><strong>Advanced Configuration</strong></header>
+            <form method="post" action="/i/${encodeURIComponent(inst.slug)}/config">
+              <label>
+                System Prompt
+                <small class="muted-text">Override the default behavior and persona.</small>
+                <textarea name="systemPrompt" rows="4" placeholder="You do NOT need to set this if using default model behavior.">${escapeHtml(inst.system_prompt || "")}</textarea>
+              </label>
+              
+              <hr />
+              
+              <strong>Plugins</strong>
+              <small class="muted-text display-block" style="margin-bottom: 0.5rem;">Enable additional integrations. Configure their keys in the 'API Keys' section.</small>
+              
+              <label>
+                <input type="checkbox" name="plugin_email" ${inst.plugins_config && JSON.parse(inst.plugins_config).email?.enabled ? "checked" : ""} />
+                Enable Email (requires SMTP keys)
+              </label>
+              <label>
+                <input type="checkbox" name="plugin_twilio" ${inst.plugins_config && JSON.parse(inst.plugins_config).twilio?.enabled ? "checked" : ""} />
+                Enable Twilio (SMS/Voice)
+              </label>
+              <label>
+                <input type="checkbox" name="plugin_slack" ${inst.plugins_config && JSON.parse(inst.plugins_config).slack?.enabled ? "checked" : ""} />
+                Enable Slack
+              </label>
+
+              <button type="submit" class="secondary outline">Update Configuration</button>
+            </form>
+          </article>
+
+          <!-- System Ops -->
+          <article>
+            <header><strong>System Operations</strong></header>
+            <form method="post" action="/i/${encodeURIComponent(inst.slug)}/restart">
+                <button type="submit" class="contrast outline">Restart Container</button>
+            </form>
+            
+            <hr />
+            
+             <form method="post" action="/i/${encodeURIComponent(inst.slug)}/power">
+              <label>
+                <input type="checkbox" name="enabled" value="true" ${inst.power_user_enabled ? "checked" : ""} />
+                Enable OpenClaw Developer Dashboard
+              </label>
+              <button type="submit" class="secondary">Save Preference</button>
+            </form>
+             ${inst.power_user_enabled
+        ? `<a role="button" href="/i/${encodeURIComponent(inst.slug)}/openclaw" class="contrast">Launch Dashboard</a>`
+        : ``
       }
+          </article>
+        </div>
       </div>
     `,
+      `
+    // Client-side status polling
+    async function updateStatus() {
+        try {
+            const res = await fetch('/i/${encodeURIComponent(inst.slug)}/status');
+            const data = await res.json();
+            const dot = document.getElementById('status-dot');
+            const text = document.getElementById('status-text');
+            
+            dot.className = 'status-dot ' + (data.status === 'running' ? 'running' : 'stopped');
+            text.textContent = data.status === 'running' 
+                ? 'Running (Up since ' + new Date(data.startedAt).toLocaleTimeString() + ')' 
+                : 'Stopped';
+        } catch (e) {
+            console.error('Status poll failed', e);
+        }
+    }
+    
+    // Poll every 5 seconds
+    setInterval(updateStatus, 5000);
+    updateStatus(); // Initial call
+    `
     ),
   );
 });
+
 
 app.post("/i/:slug/restart", requireAuth, async (req, res) => {
   const session = (req as AuthedRequest).session;
   const inst = await getInstanceBySlug(String(req.params.slug || ""));
   if (!inst) return res.status(404).send("not found");
   if (!(await userHasInstanceAccess(session.userId, inst.id))) return res.status(403).send("forbidden");
-  await restartOpenClawContainer(inst.container_name);
+  await rebootInstance(inst);
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
 
@@ -407,7 +563,7 @@ app.post("/i/:slug/secrets", requireAuth, async (req, res) => {
   if (!value.trim()) return res.status(400).send("empty value");
   await upsertInstanceSecret(inst.id, key, value.trim());
   // Restart container to pick up new environment variables
-  await restartOpenClawContainer(inst.container_name);
+  await rebootInstance(inst);
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
 
@@ -425,7 +581,7 @@ app.post("/i/:slug/model", requireAuth, async (req, res) => {
     defaultModel: model || null,
     powerUserEnabled: inst.power_user_enabled,
   });
-  await restartOpenClawContainer(inst.container_name);
+  await rebootInstance(inst);
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
 
@@ -443,9 +599,26 @@ app.post("/i/:slug/owner", requireAuth, async (req, res) => {
     defaultModel: inst.default_model,
     powerUserEnabled: inst.power_user_enabled,
   });
-  await restartOpenClawContainer(inst.container_name);
+  await rebootInstance(inst);
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
+
+async function rebootInstance(inst: InstanceRow) {
+  const secrets = await getInstanceSecrets(inst.id);
+  // Recreate container to apply new env vars
+  const runtime = await recreateOpenClawContainer({
+    instanceId: inst.id,
+    slug: inst.slug,
+    ownerE164: inst.owner_e164,
+    defaultModel: inst.default_model,
+    powerUserEnabled: inst.power_user_enabled,
+    systemPrompt: inst.system_prompt,
+    plugins: inst.plugins_config ? JSON.parse(inst.plugins_config) : undefined,
+    env: secrets,
+  });
+  // Update gateway token since recreation generates a new one
+  await upsertInstanceSecret(inst.id, "OPENCLAW_GATEWAY_TOKEN", runtime.gatewayToken);
+}
 
 async function withOpenClawClient(inst: InstanceRow, fn: (c: OpenClawWsClient) => Promise<any>) {
   const secrets = await getInstanceSecrets(inst.id);
@@ -457,21 +630,79 @@ async function withOpenClawClient(inst: InstanceRow, fn: (c: OpenClawWsClient) =
   // Get the container's exposed port
   const { docker } = await import("./docker/openclaw.js");
   const container = docker.getContainer(inst.container_name);
-  const inspectData = await container.inspect();
-  const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
-  if (!hostPort) {
-    throw new Error(`Container ${inst.container_name} has no exposed port`);
+
+  let inspectData;
+  try {
+    inspectData = await container.inspect();
+  } catch (err: any) {
+    if (err.statusCode === 404) {
+      throw new Error(`Container ${inst.container_name} not found. Try restarting the instance.`);
+    }
+    throw err;
   }
 
-  const wsUrl = `ws://localhost:${hostPort}/openclaw/${inst.slug}`;
+  if (!inspectData.State.Running) {
+    throw new Error(`Container ${inst.container_name} is not running. Try restarting the instance.`);
+  }
+
+  const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
+  if (!hostPort) {
+    throw new Error(`Container ${inst.container_name} has no exposed port. Try restarting the instance.`);
+  }
+
+  // OpenClaw gateway WebSocket is at root path, not at basePath
+  const wsUrl = `ws://localhost:${hostPort}`;
+  console.log(`[withOpenClawClient] Connecting to ${wsUrl} for instance ${inst.slug}`);
+
   const client = new OpenClawWsClient(wsUrl, token);
   try {
     await client.connect();
+    console.log(`[withOpenClawClient] Connected successfully to ${inst.slug}`);
     return await fn(client);
+  } catch (err) {
+    console.error(`[withOpenClawClient] Failed to connect to ${wsUrl}:`, err);
+    throw err;
   } finally {
     client.close();
   }
 }
+
+app.post("/i/:slug/config", requireAuth, async (req, res) => {
+  const session = (req as AuthedRequest).session;
+  const inst = await getInstanceBySlug(String(req.params.slug || ""));
+  if (!inst) return res.status(404).send("not found");
+  if (!(await userHasInstanceAccess(session.userId, inst.id))) return res.status(403).send("forbidden");
+
+  const systemPrompt = String(req.body?.systemPrompt || "").trim();
+
+  const plugins = {
+    email: { enabled: req.body?.plugin_email === "on" },
+    twilio: { enabled: req.body?.plugin_twilio === "on" },
+    slack: { enabled: req.body?.plugin_slack === "on" },
+  };
+
+  await query(
+    "update instances set system_prompt=$1, plugins_config=$2, updated_at=now() where id=$3",
+    [systemPrompt || null, JSON.stringify(plugins), inst.id]
+  );
+
+  // Re-fetch to get latest state for config rebuild
+  const updatedInst = await getInstanceBySlug(inst.slug);
+  if (updatedInst) {
+    await updateOpenClawConfig({
+      volumeName: updatedInst.state_volume,
+      slug: updatedInst.slug,
+      ownerE164: updatedInst.owner_e164,
+      defaultModel: updatedInst.default_model,
+      powerUserEnabled: updatedInst.power_user_enabled,
+      systemPrompt: updatedInst.system_prompt,
+      plugins: updatedInst.plugins_config ? JSON.parse(updatedInst.plugins_config) : undefined,
+    });
+    await rebootInstance(updatedInst);
+  }
+
+  res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
+});
 
 app.post("/i/:slug/whatsapp/qr/start", requireAuth, async (req, res) => {
   const session = (req as AuthedRequest).session;
@@ -479,24 +710,103 @@ app.post("/i/:slug/whatsapp/qr/start", requireAuth, async (req, res) => {
   if (!inst) return res.status(404).send("not found");
   if (!(await userHasInstanceAccess(session.userId, inst.id))) return res.status(403).send("forbidden");
 
-  const out = await withOpenClawClient(inst, (c) => c.whatsappQrStart(true));
+  let out: { message?: string; qrDataUrl?: string } | null = null;
+  let error: string | null = null;
+  let alreadyConnected = false;
+
+  try {
+    // First check channel status to see if WhatsApp is in a good state
+    const channelStatus = await withOpenClawClient(inst, (c) => c.channelsStatus());
+    console.log(`[whatsapp/qr/start] Channel status for ${inst.slug}:`, JSON.stringify(channelStatus));
+
+    // Check if WhatsApp is already connected
+    const waStatus = channelStatus?.whatsapp || channelStatus?.channels?.whatsapp;
+    if (waStatus?.connected || waStatus?.status === 'connected' || waStatus?.loggedIn) {
+      alreadyConnected = true;
+    } else {
+      // Try to get QR code
+      out = await withOpenClawClient(inst, (c) => c.whatsappQrStart(true));
+
+      // Check if the response indicates already connected (no QR returned but no error)
+      if (!out?.qrDataUrl && out?.message?.toLowerCase().includes('timed out')) {
+        // After logout, may need container restart
+        error = "WhatsApp session needs reinitialization. Please restart the container.";
+      }
+    }
+  } catch (err: any) {
+    console.error(`[whatsapp/qr/start] Error for ${inst.slug}:`, err);
+    const errMsg = err.message || "";
+    // "Timed out waiting for WhatsApp QR" likely means WhatsApp needs restart after logout
+    if (errMsg.toLowerCase().includes('timed out') && errMsg.toLowerCase().includes('whatsapp')) {
+      error = "WhatsApp session needs reinitialization. Please restart the container.";
+    } else {
+      error = errMsg || "Failed to connect to OpenClaw container";
+    }
+  }
+
+  if (alreadyConnected) {
+    res.send(
+      page(
+        `WhatsApp Connected - ${inst.slug}`,
+        `
+        <header class="container" style="padding-bottom: 0; border: none; margin-bottom: 1rem;">
+          <nav aria-label="breadcrumb">
+              <ul>
+              <li><a href="/instances">Instances</a></li>
+              <li><a href="/i/${encodeURIComponent(inst.slug)}">${escapeHtml(inst.slug)}</a></li>
+              <li>WhatsApp</li>
+              </ul>
+          </nav>
+          <h1>WhatsApp Already Connected</h1>
+        </header>
+
+        <article class="container" style="text-align: center;">
+          <h2 style="color: var(--pico-ins-color);">Connected</h2>
+          <p>WhatsApp is already linked to this instance. No QR code needed.</p>
+          <p class="muted-text">If you want to reconnect with a different account, you'll need to log out from WhatsApp first.</p>
+          <footer>
+              <a role="button" href="/i/${encodeURIComponent(inst.slug)}">Back to Dashboard</a>
+          </footer>
+        </article>
+      `,
+      ),
+    );
+    return;
+  }
+
   const qr = (out?.qrDataUrl as string | undefined) ?? null;
   res.send(
     page(
       `WhatsApp QR - ${inst.slug}`,
       `
-      <div class="row" style="justify-content: space-between;">
-        <h1>WhatsApp QR</h1>
-        <a href="/i/${encodeURIComponent(inst.slug)}">Back</a>
-      </div>
-      <div class="card">
-        <div>${escapeHtml(String(out?.message ?? ""))}</div>
-        ${qr
-        ? `<div><img class="qr" src="${escapeHtml(qr)}" alt="WhatsApp QR" /></div>`
-        : `<div class="muted">No QR returned.</div>`
-      }
-        <div class="muted">Open WhatsApp on your phone: Linked Devices -> Link a device -> scan.</div>
-      </div>
+      <header class="container" style="padding-bottom: 0; border: none; margin-bottom: 1rem;">
+        <nav aria-label="breadcrumb">
+            <ul>
+            <li><a href="/instances">Instances</a></li>
+            <li><a href="/i/${encodeURIComponent(inst.slug)}">${escapeHtml(inst.slug)}</a></li>
+            <li>WhatsApp QR</li>
+            </ul>
+        </nav>
+        <h1>Connect WhatsApp</h1>
+      </header>
+
+      <article class="container" style="text-align: center;">
+        ${error
+        ? `<div class="error-message" style="color: var(--pico-del-color); margin-bottom: 1rem;">
+            <strong>Error:</strong> ${escapeHtml(error)}
+           </div>
+           <p><a href="/i/${encodeURIComponent(inst.slug)}">Back to Dashboard</a> |
+              <a href="/i/${encodeURIComponent(inst.slug)}/restart" onclick="event.preventDefault(); fetch('/i/${encodeURIComponent(inst.slug)}/restart', {method:'POST'}).then(() => location.reload())">Try Restarting Container</a></p>`
+        : `<div>${escapeHtml(String(out?.message ?? ""))}</div>
+           ${qr
+             ? `<div><img class="qr" src="${escapeHtml(qr)}" alt="WhatsApp QR" /></div>`
+             : `<p class="muted-text">No QR code returned. Try restarting the container.</p>`
+           }
+           <footer>
+               <small class="muted-text">Open WhatsApp on your phone → Settings → Linked Devices → Link a Device</small>
+           </footer>`
+        }
+      </article>
     `,
     ),
   );
@@ -507,22 +817,49 @@ app.post("/i/:slug/whatsapp/qr/wait", requireAuth, async (req, res) => {
   const inst = await getInstanceBySlug(String(req.params.slug || ""));
   if (!inst) return res.status(404).send("not found");
   if (!(await userHasInstanceAccess(session.userId, inst.id))) return res.status(403).send("forbidden");
-  const out = await withOpenClawClient(inst, (c) => c.whatsappQrWait());
-  if (out?.connected) {
-    await query("update instances set last_whatsapp_connected_at=now() where id=$1", [inst.id]);
+
+  let out: { message?: string; connected?: boolean } | null = null;
+  let error: string | null = null;
+
+  try {
+    out = await withOpenClawClient(inst, (c) => c.whatsappQrWait());
+    if (out?.connected) {
+      await query("update instances set last_whatsapp_connected_at=now() where id=$1", [inst.id]);
+    }
+  } catch (err: any) {
+    console.error(`[whatsapp/qr/wait] Error for ${inst.slug}:`, err);
+    error = err.message || "Failed to connect to OpenClaw container";
   }
+
   res.send(
     page(
       `WhatsApp status - ${inst.slug}`,
       `
-      <div class="row" style="justify-content: space-between;">
-        <h1>WhatsApp status</h1>
-        <a href="/i/${encodeURIComponent(inst.slug)}">Back</a>
-      </div>
-      <div class="card">
-        <div><b>Connected</b>: ${escapeHtml(String(Boolean(out?.connected)))}</div>
-        <div>${escapeHtml(String(out?.message ?? ""))}</div>
-      </div>
+       <header class="container" style="padding-bottom: 0; border: none; margin-bottom: 1rem;">
+         <nav aria-label="breadcrumb">
+            <ul>
+            <li><a href="/instances">Instances</a></li>
+             <li><a href="/i/${encodeURIComponent(inst.slug)}">${escapeHtml(inst.slug)}</a></li>
+            <li>WhatsApp Status</li>
+            </ul>
+        </nav>
+         <h1>Connection Status</h1>
+      </header>
+
+      <article class="container">
+        ${error
+        ? `<div class="error-message" style="color: var(--pico-del-color); margin-bottom: 1rem;">
+            <strong>Error:</strong> ${escapeHtml(error)}
+           </div>`
+        : `<hgroup>
+            <h2>${out?.connected ? "Connected" : "Not Connected"}</h2>
+            <p>${escapeHtml(String(out?.message ?? ""))}</p>
+           </hgroup>`
+        }
+        <footer>
+            <a role="button" href="/i/${encodeURIComponent(inst.slug)}">Back to Dashboard</a>
+        </footer>
+      </article>
     `,
     ),
   );
@@ -545,7 +882,7 @@ app.post("/i/:slug/power", requireAuth, async (req, res) => {
     defaultModel: inst.default_model,
     powerUserEnabled: enabled,
   });
-  await restartOpenClawContainer(inst.container_name);
+  await rebootInstance(inst);
   res.redirect(`/i/${encodeURIComponent(inst.slug)}`);
 });
 
@@ -630,4 +967,3 @@ server.listen(port, () => {
   console.log(`nc-control listening on ${port}`);
   requireSslInProd();
 });
-

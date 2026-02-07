@@ -7,6 +7,7 @@ export type InstanceRuntime = {
   volumeName: string;
   gatewayToken: string;
   wsUrl: string; // ws://<containerName>:18789/<optionalPath>
+  hostPort: number;
 };
 
 // Configure Docker socket path
@@ -34,11 +35,35 @@ function gatewayToken(): string {
   return randomBytes(32).toString("hex");
 }
 
+
+
+export async function updateOpenClawConfig(params: {
+  volumeName: string;
+  slug: string;
+  ownerE164?: string | null;
+  defaultModel?: string | null;
+  powerUserEnabled: boolean;
+  systemPrompt?: string | null;
+  plugins?: {
+    email?: { enabled: boolean; };
+    twilio?: { enabled: boolean; };
+    slack?: { enabled: boolean; };
+  };
+}) {
+  await initVolume(params);
+}
+
 function buildOpenClawConfigJson(params: {
   slug: string;
   ownerE164?: string | null;
   defaultModel?: string | null;
   powerUserEnabled: boolean;
+  systemPrompt?: string | null;
+  plugins?: {
+    email?: { enabled: boolean; };
+    twilio?: { enabled: boolean; };
+    slack?: { enabled: boolean; };
+  };
 }): string {
   const basePath = `/openclaw/${params.slug}`;
   const whatsapp: any = {};
@@ -69,14 +94,25 @@ function buildOpenClawConfigJson(params: {
     plugins: {
       entries: {
         whatsapp: {
-          enabled: true, // Auto-enable WhatsApp plugin
+          enabled: true,
         },
+        ...(params.plugins?.email?.enabled ? { email: { enabled: true } } : {}),
+        ...(params.plugins?.twilio?.enabled ? { twilio: { enabled: true } } : {}),
+        ...(params.plugins?.slack?.enabled ? { slack: { enabled: true } } : {}),
       },
     },
   };
 
+  const agentsDefaults: any = {};
   if (params.defaultModel && params.defaultModel.trim()) {
-    cfg.agents = { defaults: { model: { primary: params.defaultModel.trim() } } };
+    agentsDefaults.model = { primary: params.defaultModel.trim() };
+  }
+  if (params.systemPrompt && params.systemPrompt.trim()) {
+    agentsDefaults.systemPrompt = params.systemPrompt.trim();
+  }
+
+  if (Object.keys(agentsDefaults).length > 0) {
+    cfg.agents = { defaults: agentsDefaults };
   }
 
   return JSON.stringify(cfg, null, 2);
@@ -88,18 +124,18 @@ async function initVolume(opts: {
   ownerE164?: string | null;
   defaultModel?: string | null;
   powerUserEnabled: boolean;
+  systemPrompt?: string | null;
+  plugins?: {
+    email?: { enabled: boolean; };
+    twilio?: { enabled: boolean; };
+    slack?: { enabled: boolean; };
+  };
 }) {
   const mountPath = config.docker.dataMountPath;
   const stateDir = `${mountPath}/.openclaw`;
   const workspaceDir = `${mountPath}/workspace`;
-  const cfg = buildOpenClawConfigJson({
-    slug: opts.slug,
-    ownerE164: opts.ownerE164,
-    defaultModel: opts.defaultModel,
-    powerUserEnabled: opts.powerUserEnabled,
-  });
+  const cfg = buildOpenClawConfigJson(opts);
 
-  // Root init container sets ownership to uid 1000 (OpenClaw runs as node user).
   const cmd = [
     "sh",
     "-lc",
@@ -136,6 +172,12 @@ export async function createOpenClawInstance(params: {
   ownerE164?: string | null;
   defaultModel?: string | null;
   powerUserEnabled: boolean;
+  systemPrompt?: string | null;
+  plugins?: {
+    email?: { enabled: boolean };
+    twilio?: { enabled: boolean };
+    slack?: { enabled: boolean };
+  };
   env: Record<string, string>;
 }): Promise<InstanceRuntime> {
   await ensureNetwork();
@@ -151,6 +193,8 @@ export async function createOpenClawInstance(params: {
     ownerE164: params.ownerE164,
     defaultModel: params.defaultModel,
     powerUserEnabled: params.powerUserEnabled,
+    systemPrompt: params.systemPrompt,
+    plugins: params.plugins,
   });
 
   const envPairs = Object.entries({
@@ -174,13 +218,11 @@ export async function createOpenClawInstance(params: {
           Target: config.docker.dataMountPath,
         },
       ],
-      // Resource limits: 2GB RAM, 2 CPUs
-      Memory: 2 * 1024 * 1024 * 1024, // 2GB
-      NanoCpus: 2_000_000_000, // 2 CPUs
+      Memory: 2 * 1024 * 1024 * 1024,
+      NanoCpus: 2_000_000_000,
       PidsLimit: 512,
-      // Expose port so host can connect via localhost
       PortBindings: {
-        "18789/tcp": [{ HostPort: "0" }], // Docker assigns random available port
+        "18789/tcp": [{ HostPort: "0" }],
       },
     },
     ExposedPorts: {
@@ -197,7 +239,6 @@ export async function createOpenClawInstance(params: {
 
   await c.start();
 
-  // Get the dynamically assigned host port
   const inspectData = await c.inspect();
   const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
   if (!hostPort) {
@@ -213,32 +254,102 @@ export async function createOpenClawInstance(params: {
   };
 }
 
-export async function restartOpenClawContainer(containerName: string) {
-  const c = docker.getContainer(containerName);
-  try {
-    await c.inspect();
-    await c.restart();
-  } catch (err: any) {
-    // Container doesn't exist - this is expected if it was manually removed or failed to create
-    if (err.statusCode === 404) {
-      throw new Error(`Container ${containerName} does not exist. Please recreate the instance.`);
-    }
-    throw err;
-  }
-}
-
-export async function updateOpenClawConfig(params: {
-  volumeName: string;
+export async function recreateOpenClawContainer(params: {
+  instanceId: string;
   slug: string;
   ownerE164?: string | null;
   defaultModel?: string | null;
   powerUserEnabled: boolean;
-}) {
+  systemPrompt?: string | null;
+  plugins?: {
+    email?: { enabled: boolean };
+    twilio?: { enabled: boolean };
+    slack?: { enabled: boolean };
+  };
+  env: Record<string, string>;
+}): Promise<InstanceRuntime> {
+  const containerName = `nc-openclaw-${params.instanceId}`;
+  const volumeName = `nc-openclaw-data-${params.instanceId}`;
+
+  // Stop and remove existing container if it exists
+  try {
+    const existing = docker.getContainer(containerName);
+    const info = await existing.inspect();
+    if (info.State.Running) {
+      await existing.stop();
+    }
+    await existing.remove();
+  } catch (err: any) {
+    if (err.statusCode !== 404) {
+      throw err;
+    }
+  }
+
+  // Update config on existing volume
   await initVolume({
-    volumeName: params.volumeName,
+    volumeName,
     slug: params.slug,
     ownerE164: params.ownerE164,
     defaultModel: params.defaultModel,
     powerUserEnabled: params.powerUserEnabled,
+    systemPrompt: params.systemPrompt,
+    plugins: params.plugins,
   });
+
+  const token = gatewayToken();
+  const envPairs = Object.entries({
+    ...params.env,
+    OPENCLAW_STATE_DIR: `${config.docker.dataMountPath}/.openclaw`,
+    OPENCLAW_WORKSPACE_DIR: `${config.docker.dataMountPath}/workspace`,
+    OPENCLAW_GATEWAY_TOKEN: token,
+  }).map(([k, v]) => `${k}=${v}`);
+
+  const c = await docker.createContainer({
+    name: containerName,
+    Image: config.docker.openclawImage,
+    Env: envPairs,
+    Cmd: ["node", "--max-old-space-size=1536", "dist/index.js", "gateway", "--allow-unconfigured", "--bind", "lan", "--port", "18789"],
+    HostConfig: {
+      RestartPolicy: { Name: "unless-stopped" },
+      Mounts: [
+        {
+          Type: "volume",
+          Source: volumeName,
+          Target: config.docker.dataMountPath,
+        },
+      ],
+      Memory: 2 * 1024 * 1024 * 1024,
+      NanoCpus: 2_000_000_000,
+      PidsLimit: 512,
+      PortBindings: {
+        "18789/tcp": [{ HostPort: "0" }],
+      },
+    },
+    ExposedPorts: {
+      "18789/tcp": {},
+    },
+    NetworkingConfig: {
+      EndpointsConfig: {
+        [config.docker.network]: {
+          Aliases: [containerName],
+        },
+      },
+    },
+  });
+
+  await c.start();
+
+  const inspectData = await c.inspect();
+  const hostPort = inspectData.NetworkSettings.Ports["18789/tcp"]?.[0]?.HostPort;
+  if (!hostPort) {
+    throw new Error("Failed to get assigned host port for OpenClaw container");
+  }
+
+  return {
+    containerName,
+    volumeName,
+    gatewayToken: token,
+    wsUrl: `ws://localhost:${hostPort}/openclaw/${params.slug}`,
+    hostPort: parseInt(hostPort, 10),
+  };
 }

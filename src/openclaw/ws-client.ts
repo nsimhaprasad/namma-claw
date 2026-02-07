@@ -28,25 +28,37 @@ export class OpenClawWsClient {
     });
   }
 
-  async ready(): Promise<void> {
+  async ready(timeoutMs = 10_000): Promise<void> {
     if (this.ws.readyState === WebSocket.OPEN) {
       return;
     }
     await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`WebSocket connection timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
       const onOpen = () => {
         cleanup();
         resolve();
       };
       const onErr = (err: unknown) => {
         cleanup();
-        reject(err);
+        reject(err instanceof Error ? err : new Error(`WebSocket error: ${String(err)}`));
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error("WebSocket closed before connection established"));
       };
       const cleanup = () => {
+        clearTimeout(timeout);
         this.ws.off("open", onOpen);
         this.ws.off("error", onErr);
+        this.ws.off("close", onClose);
       };
       this.ws.on("open", onOpen);
       this.ws.on("error", onErr);
+      this.ws.on("close", onClose);
     });
   }
 
@@ -87,11 +99,25 @@ export class OpenClawWsClient {
     }
   }
 
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  async request<T = unknown>(req: { method: string; params?: unknown }, timeoutMs = 60_000): Promise<T> {
     const id = randomUUID();
-    const frame = { type: "req", id, method, params };
+    const frame = { type: "req", id, method: req.method, params: req.params };
     const p = new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Request '${req.method}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timeout);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timeout);
+          reject(e);
+        },
+      });
     });
     this.ws.send(JSON.stringify(frame));
     return p;
@@ -99,30 +125,36 @@ export class OpenClawWsClient {
 
   async connect(): Promise<void> {
     await this.ready();
-    await this.request("connect", {
-      minProtocol: 3,
-      maxProtocol: 3,
-      client: {
-        id: "openclaw-cli",
-        version: "1.0.0",
-        platform: "node",
-      },
-      role: "operator",
-      scopes: ["operator.admin"],
-      device: undefined,
-      caps: [],
-      auth: { token: this.token },
-      userAgent: "nc-control/1.0",
-      locale: "en-US",
+    await this.request({
+      method: "connect",
+      params: {
+        minProtocol: 3,
+        maxProtocol: 3,
+        client: {
+          id: "gateway-client",
+          mode: "backend",
+          version: "1.0.0",
+          platform: "node",
+        },
+        role: "operator",
+        scopes: ["operator.admin"],
+        auth: { token: this.token },
+        userAgent: "nc-control/1.0",
+        locale: "en-US",
+      }
     });
   }
 
   async whatsappQrStart(force: boolean): Promise<{ message?: string; qrDataUrl?: string }> {
-    return await this.request("web.login.start", { force, timeoutMs: 30_000 });
+    // Increase timeout to 60s for QR generation, and request timeout to 90s
+    return await this.request({ method: "web.login.start", params: { force, timeoutMs: 60_000 } }, 90_000);
   }
 
   async whatsappQrWait(): Promise<{ message?: string; connected?: boolean }> {
-    return await this.request("web.login.wait", { timeoutMs: 120_000 });
+    return await this.request({ method: "web.login.wait", params: { timeoutMs: 120_000 } }, 150_000);
+  }
+
+  async channelsStatus(): Promise<any> {
+    return await this.request({ method: "channels.status", params: {} });
   }
 }
-
