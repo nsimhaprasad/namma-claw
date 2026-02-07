@@ -144,4 +144,12 @@ export class OpenClawWsClient {
     async whatsappReconnect() {
         return await this.request({ method: "whatsapp.reconnect", params: {} }, 30_000);
     }
+    // Initiate WhatsApp login flow (needed after logout)
+    async channelsLogin(channel = "whatsapp") {
+        return await this.request({ method: "channels.login", params: { channel } }, 30_000);
+    }
+    // Start WhatsApp channel
+    async whatsappStart() {
+        return await this.request({ method: "whatsapp.start", params: {} }, 30_000);
+    }
 }
