@@ -890,28 +890,12 @@ app.post("/i/:slug/whatsapp/qr/start", requireAuth, async (req, res) => {
     if (waStatus?.connected || waStatus?.status === 'connected' || waStatus?.loggedIn) {
       alreadyConnected = true;
     } else {
-      // If channel is not running or has an error, try to start/login first
+      // Log if channel has issues
       if (!waStatus?.running || waStatus?.lastError) {
-        console.log(`[whatsapp/qr/start] Channel not running or has error, attempting to initialize...`);
-        try {
-          // Try channels.login first
-          await withOpenClawClient(inst, (c) => c.channelsLogin("whatsapp"));
-          console.log(`[whatsapp/qr/start] channels.login succeeded`);
-        } catch (loginErr: any) {
-          console.log(`[whatsapp/qr/start] channels.login failed:`, loginErr.message);
-          // Try whatsapp.start as fallback
-          try {
-            await withOpenClawClient(inst, (c) => c.whatsappStart());
-            console.log(`[whatsapp/qr/start] whatsapp.start succeeded`);
-          } catch (startErr: any) {
-            console.log(`[whatsapp/qr/start] whatsapp.start failed:`, startErr.message);
-          }
-        }
-        // Wait a moment for channel to initialize
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        console.log(`[whatsapp/qr/start] Channel not running or has error:`, waStatus?.lastError);
       }
 
-      // Try to get QR code
+      // Try to get QR code with force=true to request fresh QR
       out = await withOpenClawClient(inst, (c) => c.whatsappQrStart(true));
 
       // Check if the response indicates already connected (no QR returned but no error)
@@ -1121,7 +1105,7 @@ app.post("/i/:slug/whatsapp/qr/wait", requireAuth, async (req, res) => {
   );
 });
 
-// Reset WhatsApp session (logout and clear state)
+// Reset WhatsApp session (clear all session data)
 app.post("/i/:slug/whatsapp/reset", requireAuth, async (req, res) => {
   const session = (req as AuthedRequest).session;
   const inst = await getInstanceBySlug(String(req.params.slug || ""));
@@ -1129,14 +1113,6 @@ app.post("/i/:slug/whatsapp/reset", requireAuth, async (req, res) => {
   if (!(await userHasInstanceAccess(session.userId, inst.id))) return res.status(403).send("forbidden");
 
   console.log(`[whatsapp/reset] Starting reset for ${inst.slug}`);
-
-  try {
-    // Try to logout from WhatsApp first
-    await withOpenClawClient(inst, (c) => c.whatsappLogout());
-    console.log(`[whatsapp/reset] Logged out WhatsApp for ${inst.slug}`);
-  } catch (err: any) {
-    console.log(`[whatsapp/reset] Logout attempt for ${inst.slug}:`, err.message);
-  }
 
   // Stop the container before clearing session
   try {
@@ -1146,10 +1122,10 @@ app.post("/i/:slug/whatsapp/reset", requireAuth, async (req, res) => {
     console.log(`[whatsapp/reset] Stop container error:`, err.message);
   }
 
-  // Clear WhatsApp session files from volume
+  // Clear ALL session files from volume (keeps only openclaw.json config)
   try {
     await clearWhatsAppSession(inst.state_volume);
-    console.log(`[whatsapp/reset] Cleared WhatsApp session files for ${inst.slug}`);
+    console.log(`[whatsapp/reset] Cleared session data for ${inst.slug}`);
   } catch (err: any) {
     console.log(`[whatsapp/reset] Clear session error:`, err.message);
   }

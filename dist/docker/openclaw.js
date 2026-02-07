@@ -256,19 +256,16 @@ export async function recreateOpenClawContainer(params) {
     };
 }
 // Clear WhatsApp session data from volume (for reset)
+// Deletes everything in .openclaw EXCEPT openclaw.json config
 export async function clearWhatsAppSession(volumeName) {
     const mountPath = config.docker.dataMountPath;
     const stateDir = `${mountPath}/.openclaw`;
-    // Remove WhatsApp session files/directories
-    // Common locations: whatsapp/, sessions/, auth_info*, wa_*
+    // Delete everything except openclaw.json config file
+    // This ensures all session/auth data is cleared
     const cmd = [
         "sh",
         "-c",
-        [
-            `cd ${stateDir} 2>/dev/null || exit 0`,
-            `rm -rf whatsapp sessions auth_info* wa_* baileys_* store.json 2>/dev/null || true`,
-            `echo "Cleared WhatsApp session files"`,
-        ].join(" && "),
+        `cd ${stateDir} 2>/dev/null && find . -mindepth 1 ! -name 'openclaw.json' -exec rm -rf {} + 2>/dev/null; ls -la ${stateDir}; echo "Cleared all session data"`,
     ];
     const c = await docker.createContainer({
         Image: "alpine:3.19",
@@ -285,7 +282,8 @@ export async function clearWhatsAppSession(volumeName) {
         },
     });
     await c.start();
-    await c.wait();
+    const result = await c.wait();
+    console.log(`[clearWhatsAppSession] Container exited with code ${result.StatusCode}`);
 }
 // Stop container (keeps volume and data)
 export async function stopOpenClawContainer(containerName) {
