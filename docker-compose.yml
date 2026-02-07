@@ -1,0 +1,64 @@
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-nc}
+    volumes:
+      - nc_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-nc}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nc-internal
+
+  # NC-Control Application
+  nc-control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${NC_PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-nc}
+      NC_JWT_SECRET: ${NC_JWT_SECRET:?NC_JWT_SECRET is required}
+      NC_MASTER_KEY_BASE64: ${NC_MASTER_KEY_BASE64:?NC_MASTER_KEY_BASE64 is required}
+      NC_BASE_URL: ${NC_BASE_URL:-http://localhost:3000}
+      OPENCLAW_IMAGE: ${OPENCLAW_IMAGE:-ghcr.io/anthropics/openclaw:latest}
+      NC_DOCKER_NETWORK: nc-internal
+      NC_OPENCLAW_PORT: 18789
+      NC_OPENCLAW_DATA_MOUNT: /data
+      # Use host Docker socket path (auto-detected)
+      DOCKER_SOCKET: /var/run/docker.sock
+    volumes:
+      # Mount Docker socket to manage containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - nc-internal
+
+  # OpenClaw Image Builder (optional - run with: docker compose build openclaw)
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.openclaw
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    profiles:
+      - build-openclaw
+    command: ["echo", "OpenClaw image built successfully"]
+
+networks:
+  nc-internal:
+    driver: bridge
+    name: nc-internal
+
+volumes:
+  nc_postgres_data:
