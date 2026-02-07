@@ -157,4 +157,12 @@ export class OpenClawWsClient {
   async channelsStatus(): Promise<any> {
     return await this.request({ method: "channels.status", params: {} });
   }
+
+  async whatsappLogout(): Promise<{ message?: string; success?: boolean }> {
+    return await this.request({ method: "whatsapp.logout", params: {} }, 30_000);
+  }
+
+  async whatsappReconnect(): Promise<{ message?: string; success?: boolean }> {
+    return await this.request({ method: "whatsapp.reconnect", params: {} }, 30_000);
+  }
 }

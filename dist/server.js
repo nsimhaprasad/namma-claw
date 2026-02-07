@@ -353,6 +353,15 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
                 <button type="submit" class="outline">Check Connection</button>
               </form>
             </div>
+
+            <details style="margin-top: 1rem;">
+              <summary class="muted-text" style="font-size: 0.875rem;">Troubleshooting</summary>
+              <p><small>If pairing fails or you want to use a different WhatsApp account, reset the session first.</small></p>
+              <form method="post" action="/i/${encodeURIComponent(inst.slug)}/whatsapp/reset"
+                    onsubmit="return confirm('This will disconnect WhatsApp and restart the container. Continue?')">
+                <button type="submit" class="secondary outline" style="font-size: 0.875rem;">Reset WhatsApp Session</button>
+              </form>
+            </details>
           </article>
 
           <!-- Model Config -->
@@ -525,6 +534,16 @@ app.get("/i/:slug", requireAuth, async (req, res) => {
     // Poll every 5 seconds
     setInterval(updateStatus, 5000);
     updateStatus(); // Initial call
+
+    // Check for success messages in URL
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('whatsapp') === 'connected') {
+      showToast('WhatsApp connected successfully!', 'success');
+      window.history.replaceState({}, document.title, window.location.pathname);
+    } else if (urlParams.get('whatsapp') === 'reset') {
+      showToast('WhatsApp session reset. You can now pair again.', 'info');
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
     `));
 });
 app.post("/i/:slug/restart", requireAuth, async (req, res) => {
@@ -817,15 +836,74 @@ app.post("/i/:slug/whatsapp/qr/start", requireAuth, async (req, res) => {
            </div>
            <p><a href="/i/${encodeURIComponent(inst.slug)}">Back to Dashboard</a> |
               <a href="/i/${encodeURIComponent(inst.slug)}/restart" onclick="event.preventDefault(); fetch('/i/${encodeURIComponent(inst.slug)}/restart', {method:'POST'}).then(() => location.reload())">Try Restarting Container</a></p>`
-        : `<div>${escapeHtml(String(out?.message ?? ""))}</div>
+        : `<div id="qr-status">${escapeHtml(String(out?.message ?? "Scan QR code with WhatsApp"))}</div>
            ${qr
-            ? `<div><img class="qr" src="${escapeHtml(qr)}" alt="WhatsApp QR" /></div>`
+            ? `<div><img class="qr" src="${escapeHtml(qr)}" alt="WhatsApp QR" /></div>
+                <div id="connection-status" style="margin-top: 1rem;">
+                  <small class="muted-text">Waiting for connection... <span aria-busy="true"></span></small>
+                </div>`
             : `<p class="muted-text">No QR code returned. Try restarting the container.</p>`}
            <footer>
                <small class="muted-text">Open WhatsApp on your phone → Settings → Linked Devices → Link a Device</small>
            </footer>`}
       </article>
-    `));
+    `, qr ? `
+      // Auto-poll for connection status
+      let pollCount = 0;
+      const maxPolls = 60; // Poll for up to 2 minutes
+
+      async function checkConnection() {
+        if (pollCount >= maxPolls) {
+          document.getElementById('connection-status').innerHTML =
+            '<small class="muted-text">QR code may have expired. <a href="">Refresh</a> to get a new one.</small>';
+          return;
+        }
+        pollCount++;
+
+        try {
+          const res = await fetch('/i/${encodeURIComponent(inst.slug)}/whatsapp/status');
+          const data = await res.json();
+
+          if (data.connected) {
+            document.getElementById('connection-status').innerHTML =
+              '<strong style="color: var(--pico-ins-color);">Connected!</strong> Redirecting...';
+            setTimeout(() => {
+              window.location.href = '/i/${encodeURIComponent(inst.slug)}?whatsapp=connected';
+            }, 1000);
+            return;
+          }
+
+          // Continue polling
+          setTimeout(checkConnection, 2000);
+        } catch (e) {
+          console.error('Connection check failed', e);
+          setTimeout(checkConnection, 3000);
+        }
+      }
+
+      // Start polling after a short delay
+      setTimeout(checkConnection, 2000);
+      ` : ''));
+});
+// API endpoint to check WhatsApp connection status (for polling)
+app.get("/i/:slug/whatsapp/status", requireAuth, async (req, res) => {
+    const session = req.session;
+    const inst = await getInstanceBySlug(String(req.params.slug || ""));
+    if (!inst || !(await userHasInstanceAccess(session.userId, inst.id))) {
+        return res.status(404).json({ error: "not found" });
+    }
+    try {
+        const channelStatus = await withOpenClawClient(inst, (c) => c.channelsStatus());
+        const waStatus = channelStatus?.whatsapp || channelStatus?.channels?.whatsapp;
+        const connected = Boolean(waStatus?.connected || waStatus?.status === 'connected' || waStatus?.loggedIn);
+        if (connected) {
+            await query("update instances set last_whatsapp_connected_at=now() where id=$1", [inst.id]);
+        }
+        res.json({ connected, status: waStatus });
+    }
+    catch (err) {
+        res.json({ connected: false, error: err.message });
+    }
 });
 app.post("/i/:slug/whatsapp/qr/wait", requireAuth, async (req, res) => {
     const session = req.session;
@@ -845,6 +923,11 @@ app.post("/i/:slug/whatsapp/qr/wait", requireAuth, async (req, res) => {
     catch (err) {
         console.error(`[whatsapp/qr/wait] Error for ${inst.slug}:`, err);
         error = err.message || "Failed to connect to OpenClaw container";
+    }
+    // If connected, redirect to instance page with success message
+    if (out?.connected) {
+        res.redirect(`/i/${encodeURIComponent(inst.slug)}?whatsapp=connected`);
+        return;
     }
     res.send(page(`WhatsApp status - ${inst.slug}`, `
        <header class="container" style="padding-bottom: 0; border: none; margin-bottom: 1rem;">
@@ -872,6 +955,27 @@ app.post("/i/:slug/whatsapp/qr/wait", requireAuth, async (req, res) => {
         </footer>
       </article>
     `));
+});
+// Reset WhatsApp session (logout and clear state)
+app.post("/i/:slug/whatsapp/reset", requireAuth, async (req, res) => {
+    const session = req.session;
+    const inst = await getInstanceBySlug(String(req.params.slug || ""));
+    if (!inst)
+        return res.status(404).send("not found");
+    if (!(await userHasInstanceAccess(session.userId, inst.id)))
+        return res.status(403).send("forbidden");
+    try {
+        // Try to logout from WhatsApp
+        await withOpenClawClient(inst, (c) => c.whatsappLogout());
+        console.log(`[whatsapp/reset] Logged out WhatsApp for ${inst.slug}`);
+    }
+    catch (err) {
+        console.log(`[whatsapp/reset] Logout attempt for ${inst.slug}:`, err.message);
+        // Continue even if logout fails - the restart will clear the session
+    }
+    // Restart container to fully reset the session
+    await rebootInstance(inst);
+    res.redirect(`/i/${encodeURIComponent(inst.slug)}?whatsapp=reset`);
 });
 app.post("/i/:slug/power", requireAuth, async (req, res) => {
     const session = req.session;

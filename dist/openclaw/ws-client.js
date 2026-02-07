@@ -15,25 +15,36 @@ export class OpenClawWsClient {
             // close handler will trigger
         });
     }
-    async ready() {
+    async ready(timeoutMs = 10_000) {
         if (this.ws.readyState === WebSocket.OPEN) {
             return;
         }
         await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error(`WebSocket connection timeout after ${timeoutMs}ms`));
+            }, timeoutMs);
             const onOpen = () => {
                 cleanup();
                 resolve();
             };
             const onErr = (err) => {
                 cleanup();
-                reject(err);
+                reject(err instanceof Error ? err : new Error(`WebSocket error: ${String(err)}`));
+            };
+            const onClose = () => {
+                cleanup();
+                reject(new Error("WebSocket closed before connection established"));
             };
             const cleanup = () => {
+                clearTimeout(timeout);
                 this.ws.off("open", onOpen);
                 this.ws.off("error", onErr);
+                this.ws.off("close", onClose);
             };
             this.ws.on("open", onOpen);
             this.ws.on("error", onErr);
+            this.ws.on("close", onClose);
         });
     }
     close() {
@@ -74,39 +85,63 @@ export class OpenClawWsClient {
             return;
         }
     }
-    request(method, params) {
+    async request(req, timeoutMs = 60_000) {
         const id = randomUUID();
-        const frame = { type: "req", id, method, params };
+        const frame = { type: "req", id, method: req.method, params: req.params };
         const p = new Promise((resolve, reject) => {
-            this.pending.set(id, { resolve, reject });
+            const timeout = setTimeout(() => {
+                this.pending.delete(id);
+                reject(new Error(`Request '${req.method}' timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+            this.pending.set(id, {
+                resolve: (v) => {
+                    clearTimeout(timeout);
+                    resolve(v);
+                },
+                reject: (e) => {
+                    clearTimeout(timeout);
+                    reject(e);
+                },
+            });
         });
         this.ws.send(JSON.stringify(frame));
         return p;
     }
     async connect() {
         await this.ready();
-        await this.request("connect", {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-                id: "nc-web",
-                version: "dev",
-                platform: "server",
-                mode: "webchat",
-            },
-            role: "operator",
-            scopes: ["operator.admin"],
-            device: undefined,
-            caps: [],
-            auth: { token: this.token },
-            userAgent: "nc-web",
-            locale: "en-US",
+        await this.request({
+            method: "connect",
+            params: {
+                minProtocol: 3,
+                maxProtocol: 3,
+                client: {
+                    id: "gateway-client",
+                    mode: "backend",
+                    version: "1.0.0",
+                    platform: "node",
+                },
+                role: "operator",
+                scopes: ["operator.admin"],
+                auth: { token: this.token },
+                userAgent: "nc-control/1.0",
+                locale: "en-US",
+            }
         });
     }
     async whatsappQrStart(force) {
-        return await this.request("web.login.start", { force, timeoutMs: 30_000 });
+        // Increase timeout to 60s for QR generation, and request timeout to 90s
+        return await this.request({ method: "web.login.start", params: { force, timeoutMs: 60_000 } }, 90_000);
     }
     async whatsappQrWait() {
-        return await this.request("web.login.wait", { timeoutMs: 120_000 });
+        return await this.request({ method: "web.login.wait", params: { timeoutMs: 120_000 } }, 150_000);
+    }
+    async channelsStatus() {
+        return await this.request({ method: "channels.status", params: {} });
+    }
+    async whatsappLogout() {
+        return await this.request({ method: "whatsapp.logout", params: {} }, 30_000);
+    }
+    async whatsappReconnect() {
+        return await this.request({ method: "whatsapp.reconnect", params: {} }, 30_000);
     }
 }
